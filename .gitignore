@@ -1,0 +1,30 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments / caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime downloads, ComfyUI checkout, model weights
+runtime/
+ComfyUI/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.gguf
+
+# Generated projects / logs
+generated_presentations/
+comfyui_server.log
+*.log
+*.part
+.DS_Store
+Thumbs.db
+archive/
