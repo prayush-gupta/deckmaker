@@ -1,0 +1,17 @@
+deactivate                                # if a venv is active
+python3.15 -m pip freeze > requirements.txt     # Windows: py -3.14.8 -m pip freeze > requirements.txt
+
+### MAC
+
+rm -rf venv
+python -m venv venv
+source venv/bin/activate
+python --version
+python -m pip install -r requirements.txt
+
+
+### Windows
+Remove-Item -Recurse -Force .venv
+venv\Scripts\Activate.ps1
+python --version
+python -m pip install -r requirements.txt
