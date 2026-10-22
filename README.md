@@ -1,3 +1,17 @@
+# Deckmaker — Local-First AI Presentation Maker
+
+Deckmaker is an open-source AI presentation maker that helps you create PowerPoint presentations using locally run AI models. It brings together Ollama for language-model workflows, ComfyUI for image generation, and Python-based slide rendering to turn ideas into editable presentation decks.
+Unlike hosted presentation services, Deckmaker is designed to give you more control over your models, generation workflow, and files on your own machine.
+
+- Local-first workflow: Run supported AI components on your own hardware.
+- AI-generated visuals: Create presentation imagery through a compatible ComfyUI setup.
+- PowerPoint output: Generate editable .pptx presentations.
+- Customizable slides: Use the available slide layouts and design options.
+- Save and resume: Continue supported presentation sessions without starting over.
+
+See the setup guide below for requirements, installation instructions, and configuration details.
+
+
 # AI Presentation Studio
 
 A local-first Gradio app that uses Ollama for presentation planning and content, ComfyUI + Z-Image Turbo for slide artwork, and a Python PowerPoint renderer for the final editable `.pptx` deck. It includes a visual layout selector, research enrichment (optional API keys), and save/resume checkpoints.
@@ -5,6 +19,42 @@ A local-first Gradio app that uses Ollama for presentation planning and content,
 The repository is designed to bootstrap its own local runtime on Windows, macOS, and Linux. The first run installs Python dependencies, installs/starts Ollama when possible, pulls an Ollama model, clones ComfyUI, installs its Python dependencies, downloads the required image-model weights, and then launches the app in your browser.
 
 > **Important hardware note:** “automatic setup” cannot remove local AI hardware requirements. Image generation needs substantial disk space and a capable GPU for a good experience. The installer selects a lower-memory Z-Image variant on most systems, but CPU-only or low-memory machines may be extremely slow or unable to generate images. Read [Hardware and downloads](#hardware-and-downloads) before the first run.
+
+# AI Presentation Studio — Documentation Pack
+
+This pack documents the public `prayush-gupta/deckmaker` repository as inspected on 22 October 2026. It is intended to be copied into the repository root (or merged into an existing `docs/` directory).
+
+## Reading order
+
+1. [Product rationale](docs/01-product-rationale.md) — why a local presentation maker is useful and what trade-offs it introduces.
+2. [Architecture](docs/02-architecture.md) — component map, data boundaries, and system diagrams.
+3. [End-to-end workflows](docs/03-workflows.md) — setup, deck creation, layout/image generation, save/resume, and export.
+4. [Codebase reference](docs/04-codebase-reference.md) — responsibilities and relationships of the main files.
+5. [Operations and safeguards](docs/05-operations-safeguards.md) — configuration, troubleshooting, recovery behavior, limitations, and suggested tests.
+6. [Glossary](docs/06-glossary.md) — common terms.
+
+## Main system at a glance
+
+```mermaid
+flowchart LR
+    U[User in browser] <--> UI[Gradio UI: app.py]
+    UI --> LLM[Ollama local API]
+    UI --> R[Optional online research]
+    UI --> LM[Layout manager and catalogue]
+    UI --> IMG[Image generation client]
+    IMG --> C[ComfyUI local server]
+    LM --> ENG[Slide layout engine]
+    ENG --> PPTX[Editable PowerPoint]
+    ENG --> PNG[PNG previews]
+    UI <--> S[Session JSON and project files]
+```
+
+## Repository entry points
+
+- `start_windows.bat` → `scripts/start_windows.ps1` → `setup_environment.py` on Windows.
+- `start.sh` → `setup_environment.py` on macOS/Linux.
+- `app.py` starts the Gradio application after setup.
+
 
 ## Quick start
 
