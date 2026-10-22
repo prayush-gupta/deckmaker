@@ -107,11 +107,21 @@ def server_is_up(timeout=2) -> bool:
         return False
 
 
+def _split_args(text):
+    """Split a command line into arguments, dropping the quotes around quoted parts.
+
+    shlex.split(posix=False) keeps the quote characters inside each token on Windows, so a path
+    like "C:\\Program Files\\x.yaml" would reach the program with literal quotes in it.
+    """
+    parts = shlex.split(text, posix=(os.name != "nt"))
+    return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
+
+
 def _launch_command():
     if COMFYUI_CMD:
-        return shlex.split(COMFYUI_CMD, posix=(os.name != "nt")), None
+        return _split_args(COMFYUI_CMD), (COMFYUI_DIR or None)
     if COMFYUI_DIR and os.path.exists(os.path.join(COMFYUI_DIR, "main.py")):
-        return [COMFYUI_PYTHON, "main.py"] + shlex.split(COMFYUI_ARGS, posix=(os.name != "nt")), COMFYUI_DIR
+        return [COMFYUI_PYTHON, "main.py"] + _split_args(COMFYUI_ARGS), COMFYUI_DIR
     return None, None
 
 

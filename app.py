@@ -5,6 +5,10 @@ from datetime import datetime
 import glob
 import json
 import os
+import time
+import html as _html
+import threading
+import contextvars
 import warnings
 import urllib.request
 import urllib.error
@@ -364,6 +368,93 @@ def regenerate_single_slide(ollama, slide_index, current_title, current_content,
         return gr.update(), gr.update()
 
 
+# --- LIVE PROGRESS PANEL --------------------------------------------------------------------
+# Long jobs run in a worker thread while a generator streams a checkpoint list + spinner to the page.
+_PROGRESS = {"steps": [], "t0": 0.0}
+_progress_lock = threading.Lock()
+
+PROGRESS_CSS = """
+.pg-card { border: 1px solid #2c3854; border-radius: 12px; padding: 14px 18px; background: #101725; color: #e2e8f0; }
+.pg-head { display: flex; align-items: center; gap: 12px; font-weight: 600; font-size: 1.05rem; }
+.pg-time { margin-left: auto; font-variant-numeric: tabular-nums; color: #93a1b8; font-weight: 400; }
+.pg-spin { width: 20px; height: 20px; border: 3px solid #2c3854; border-top-color: #60a5fa; border-radius: 50%;
+           animation: pg-rot 0.9s linear infinite; flex: none; }
+@keyframes pg-rot { to { transform: rotate(360deg); } }
+.pg-steps { list-style: none; margin: 10px 0 0 0; padding: 0; font-size: 0.93rem; }
+.pg-steps li { padding: 2px 0; color: #93a1b8; }
+.pg-steps li.done::before { content: "\\2713  "; color: #34d399; }
+.pg-steps li.now { color: #f8fafc; }
+.pg-steps li.now::before { content: "\\25B6  "; color: #60a5fa; }
+.pg-steps li .t { float: right; font-variant-numeric: tabular-nums; }
+"""
+
+
+def progress_reset():
+    with _progress_lock:
+        _PROGRESS["steps"] = []
+        _PROGRESS["t0"] = time.time()
+
+
+def progress(msg):
+    """Record a checkpoint (shown live in the page and printed to the console)."""
+    with _progress_lock:
+        _PROGRESS["steps"].append((time.time(), str(msg)))
+    print(f"[progress] {msg}")
+
+
+def _fmt_secs(sec):
+    sec = int(max(0, sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def progress_html(done=False, error=None):
+    with _progress_lock:
+        steps = list(_PROGRESS["steps"])
+        t0 = _PROGRESS["t0"] or time.time()
+    now = time.time()
+    if error:
+        head = f'<span>&#10060;</span><span>Stopped: {_html.escape(str(error))[:300]}</span>'
+    elif done:
+        head = '<span>&#9989;</span><span>Finished</span>'
+    else:
+        current = _html.escape(steps[-1][1]) if steps else "Starting"
+        head = f'<div class="pg-spin"></div><span>{current}&hellip;</span>'
+    items = []
+    for i, (ts, msg) in enumerate(steps):
+        end = steps[i + 1][0] if i + 1 < len(steps) else now
+        is_now = (i == len(steps) - 1) and not done and not error
+        items.append(f'<li class="{"now" if is_now else "done"}">{_html.escape(msg)}'
+                     f'<span class="t">{_fmt_secs(end - ts)}</span></li>')
+    return (f'<div class="pg-card"><div class="pg-head">{head}'
+            f'<span class="pg-time">{_fmt_secs(now - t0)}</span></div>'
+            f'<ul class="pg-steps">{"".join(items)}</ul></div>')
+
+
+def run_with_progress(fn, n_outputs, *args):
+    """Run fn(*args) in a worker thread; yield [no-change x n_outputs] + [progress html] every second,
+    then the real outputs + a final progress panel."""
+    progress_reset()
+    box = {}
+    ctx = contextvars.copy_context()      # keeps gr.Info / gr.Warning working inside the thread
+
+    def worker():
+        try:
+            box["result"] = ctx.run(fn, *args)
+        except BaseException as e:        # re-raised below so Gradio shows it
+            box["error"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    while t.is_alive():
+        yield [gr.update() for _ in range(n_outputs)] + [progress_html()]
+        t.join(timeout=1.0)
+    if "error" in box:
+        err = box["error"]
+        yield [gr.update() for _ in range(n_outputs)] + [progress_html(error=getattr(err, "message", None) or err)]
+        raise err
+    yield list(box["result"]) + [progress_html(done=True)]
+
+
 def slides_setup(model, slide_count=0):
     """Build the requested number of slides from the agreed conversation, render images, and fill UI slots."""
     global slide_titles, slide_contents, deck_brief, layout_recommendations, design_ready, deck_outline
@@ -385,6 +476,8 @@ def slides_setup(model, slide_count=0):
     outline_titles = outline_titles_from_conversation(global_prompt)
     print(f"[slides] outline items found: {len(outline_titles)}; target count field: {requested_count}")
 
+    progress("Reading the approved outline")
+    progress(f"Drafting slide content with {model}")
     try:
         slides = slides_from_conversation(ollama, global_prompt, model, requested_count,
                                           expected_titles=outline_titles)
@@ -405,6 +498,7 @@ def slides_setup(model, slide_count=0):
     # During content generation, let the local LLM select a few high-value evidence
     # questions. Only those questions are sent to configured online research APIs.
     SLIDE_SOURCE_FOOTERS.clear()
+    progress("Researching evidence for the slides")
     try:
         enriched, research_sources, research_status = enrich_slides_with_research(
             ollama, model, _outline_text(),
@@ -424,21 +518,38 @@ def slides_setup(model, slide_count=0):
     slides = list(zip(slide_titles, slide_contents))
 
     # one design brief for the whole deck -> every slide gets the same palette, shapes and style
+    progress("Designing the deck's visual style")
     deck_brief = deck_design_brief(slide_titles, model) or None
     print(deck_brief)
 
     # ComfyUI is started ONCE for the whole deck and shut down afterwards, which frees its VRAM
+    # One failed image must not stop the rest of the deck: try every slide, retry each once, and
+    # print the real error to the console (a toast alone is easy to miss).
+    failed_images = []
+    progress("Starting the image generator (ComfyUI) - the first start can take a minute")
     try:
         with comfyui_session(model):
             for i, (title, content) in enumerate(slides):
-                try:
-                    comfyui_img_generator(title, content, os.path.join(SLIDE_PREVIEW_DIR, f"slide_{i + 1}"), brief=deck_brief)
-                except Exception as e:
-                    gr.Warning(f"Image generation stopped at slide {i + 1}: {e}")
-                    break
+                prefix = os.path.join(SLIDE_PREVIEW_DIR, f"slide_{i + 1}")
+                progress(f"Generating background image {i + 1}/{len(slides)}")
+                for attempt in (1, 2):
+                    try:
+                        comfyui_img_generator(title, content, prefix, brief=deck_brief)
+                        print(f"[comfyui] slide {i + 1}: background generated")
+                        break
+                    except Exception as e:
+                        print(f"[comfyui] slide {i + 1} background attempt {attempt}/2 failed: {e}")
+                        if attempt == 2:
+                            failed_images.append(f"slide {i + 1}: {str(e)[:200]}")
+                        else:
+                            time.sleep(3)
     except Exception as e:
+        print(f"[comfyui] could not run the image batch: {e}")
         gr.Warning(f"Could not start ComfyUI: {e}")
+    if failed_images:
+        gr.Warning("Background generation failed for " + "; ".join(failed_images))
 
+    progress("Choosing a layout for each slide")
     # the LLM recommends a layout per slide - the user can still change any of them
     try:
         picks = recommend_layouts(
@@ -456,6 +567,7 @@ def slides_setup(model, slide_count=0):
     # recommended layout. The user can inspect the real slide and change its layout later.
     from slide_renderer import SLIDE_STRUCTURED, SLIDE_TEMPLATES
     for i, (title, raw_content) in enumerate(slides):
+        progress(f"Structuring and rendering slide {i + 1}/{len(slides)}: {title[:50]}")
         rec = layout_recommendations.get(i + 1, {})
         selected_layout = rec.get("layout_id") or (layout_ids[i] if i < len(layout_ids) else "")
         template = _resolve_template(selected_layout, title, raw_content)
@@ -485,6 +597,7 @@ def slides_setup(model, slide_count=0):
                             LAYOUT_LABELS[1])
         note_updates.append(gr.update(value=_layout_note(i, selected)))
     # First checkpoint is created only after the slide generation/initial rendering pass.
+    progress("Saving the first checkpoint")
     default_session_name = os.path.basename(os.path.normpath(PPT_DIR_FOLDER))
     initial_states = []
     for i in range(MAX_SLIDES):
@@ -686,13 +799,17 @@ def _generate_all_slides(session_name, model, *slide_states):
         try:
             if deck_brief is None:
                 deck_brief = deck_design_brief([title for _, title, _ in titled], model) or None
+            progress("Designing the deck's visual style")
+            progress("Starting the image generator (ComfyUI) - the first start can take a minute")
             with comfyui_session(model):
                 for i, title, content in titled:
+                    progress(f"Generating background image {i + 1}/{len(titled)}: {title[:50]}")
                     try:
                         comfyui_img_generator(title, content,
                                               os.path.join(SLIDE_PREVIEW_DIR, f"slide_{i + 1}"),
                                               brief=deck_brief, llm_model=model)
                     except Exception as e:
+                        print(f"[comfyui] slide {i + 1} background failed: {e}")
                         errors.append(f"slide {i + 1} background: {e}")
         except Exception as e:
             errors.append(f"ComfyUI batch: {e}")
@@ -706,6 +823,7 @@ def _generate_all_slides(session_name, model, *slide_states):
             content_updates.append(gr.update(value=content))
             image_updates.append(gr.update(value=image_path_for(i, PPT_DIR_FOLDER, SLIDE_PREVIEW_DIR)))
             continue
+        progress(f"Structuring and rendering slide {i + 1}: {title[:50]}")
         template = _resolve_template(layout, title, content)
         try:
             data = structure_for_layout(ollama, model, template, title, content, outline)
@@ -820,7 +938,42 @@ def compile_current_presentation(ppt_dir_folder, max_slides, session_name, *slid
     return compile_presentation_file(ppt_dir_folder, limit, session_name, *states)
 
 
-with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_css) as demo:
+# The page background is always dark, but Gradio picks its text colours from the viewer's device
+# setting - on a light-mode phone/laptop that gave dark text on a dark page. Force dark mode and
+# white text everywhere so the page reads the same on every device.
+FORCE_DARK_JS = """
+() => {
+    document.documentElement.style.colorScheme = 'dark';
+    document.body.classList.add('dark');
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('__theme') !== 'dark') {
+        url.searchParams.set('__theme', 'dark');
+        window.location.replace(url.toString());
+    }
+}
+"""
+WHITE_TEXT_CSS = """
+.gradio-container, .dark .gradio-container, .gradio-container * {
+    --body-text-color: #f8fafc !important;
+    --body-text-color-subdued: #e2e8f0 !important;
+    --block-title-text-color: #f8fafc !important;
+    --block-label-text-color: #f8fafc !important;
+    --block-info-text-color: #cbd5e1 !important;
+    --input-placeholder-color: #94a3b8 !important;
+    --link-text-color: #93c5fd !important;
+    --neutral-950: #f8fafc;
+}
+.gradio-container, .gradio-container label, .gradio-container span, .gradio-container p,
+.gradio-container h1, .gradio-container h2, .gradio-container h3, .gradio-container li,
+.gradio-container .prose, .gradio-container .prose *, .gradio-container .md, .gradio-container .md *,
+.gradio-container button.secondary, .gradio-container [data-testid="block-info"] {
+    color: #f8fafc;
+}
+.gradio-container [data-testid="block-info"] { color: #cbd5e1; }
+.gradio-container button.primary, .gradio-container button.primary * { color: #ffffff; }
+"""
+
+with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_css + PROGRESS_CSS + WHITE_TEXT_CSS, js=FORCE_DARK_JS) as demo:
     sessions_dir_state = gr.State(SESSIONS_DIR)
     max_slides_var = gr.State(MAX_SLIDES)
     ppt_dir_folder_var = gr.State(PPT_DIR_FOLDER)
@@ -861,8 +1014,8 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
                 model_selector.render()
                 message_input.render()
                 count_input = gr.Number(
-                    label="Slide Target Count", value=3, precision=0, minimum=0, maximum=MAX_SLIDES,
-                    interactive=True, info="upto 25 slides"
+                    label="Slide Target Count", value=0, precision=0, minimum=0, maximum=MAX_SLIDES,
+                    interactive=True, info="upto 25 slides; 0 for auto"
                 )
                 with gr.Row():
                     reset_btn = gr.Button("Reset Chat")
@@ -876,6 +1029,7 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
             with gr.Column(scale=5):
                 gr.HTML("<div style='height: 25px;'></div>")
                 generate_btn = gr.Button("✨ Initialize Slides", variant="primary")
+                progress_box = gr.HTML(value="")
             gr.HTML("<div style='width: 1px;'></div>")
 
         # --- DYNAMIC GRID INTERACTIVE COMPONENT WORKSPACE ---
@@ -912,6 +1066,7 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
                             slide_image_component = gr.Image(
                                 value=image_path_for(i, PPT_DIR_FOLDER, SLIDE_PREVIEW_DIR),
                                 label=f"Slide {i+1} preview",
+                                show_label=False,
                                 type="filepath",
                                 interactive=False,
                                 height=SLIDE_PANEL_HEIGHT,
@@ -957,8 +1112,8 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
                         slide_status = gr.Markdown("")
 
                     with gr.Row():
-                        generate_slide_btn = gr.Button(f"🎬 Generate slide {i+1}", variant="primary")
                         render_btn = gr.Button(f"🎨 Update slide {i+1} content", variant="secondary")
+                        generate_slide_btn = gr.Button(f"🎬 Generate slide {i+1}", variant="primary")
 
                     gr.HTML("<div style='height: 25px;'></div>")
 
@@ -1016,6 +1171,7 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
             # --- COMPILATION CONTROL TERMINAL PANEL LAYER ---
             gr.Markdown("---")
 
+            progress_box_all = gr.HTML(value="")
             with gr.Row(elem_id="compile-action-bar"):
                 with gr.Column(scale=5):
                     with gr.Row():
@@ -1030,10 +1186,15 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
 
         # --- EVENT ROUTERS ---
         step1_outputs = [sessions_dir_state, ppt_dir_folder_var, slide_preview_var, session_input, save_state_btn, workspace_section] + ui_slots + layout_note_components
+        n_init_outputs = len(step1_outputs) + 2
+
+        def _initialize_with_progress(*args):
+            yield from run_with_progress(initialize_or_regenerate, n_init_outputs, *args)
+
         generate_btn.click(initialize_lock, None, [submit_btn, reset_btn, generate_btn]).then(
-            fn=initialize_or_regenerate,
+            fn=_initialize_with_progress,
             inputs=[model_selector, count_input, session_input] + state_components_to_persist,
-            outputs=step1_outputs + [download_file_widget, compilation_output_box]
+            outputs=step1_outputs + [download_file_widget, compilation_output_box, progress_box]
         ).then(
             fn=_save_current_session,
             inputs=[sessions_dir_state, max_slides_var, session_input, count_input, message_input] + state_components_to_persist,
@@ -1053,10 +1214,15 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
                      sessions_dir_state, ppt_dir_folder_var, slide_preview_var, session_input, save_state_btn] + ui_slots + layout_note_components + layout_gallery_components + [message_output]
         ).then(fn=_sync_generate_button, inputs=title_textboxes, outputs=generate_btn)
 
+        n_all_outputs = 2 + len(content_textboxes) + len(slide_image_components)
+
+        def _generate_all_with_progress(*args):
+            yield from run_with_progress(_generate_all_slides, n_all_outputs, *args)
+
         generate_all_event = generate_all_btn.click(
-            fn=_generate_all_slides,
+            fn=_generate_all_with_progress,
             inputs=[session_input, model_selector] + state_components_to_persist,
-            outputs=[download_file_widget, compilation_output_box] + content_textboxes + [c for c in slide_image_components],
+            outputs=[download_file_widget, compilation_output_box] + content_textboxes + [c for c in slide_image_components] + [progress_box_all],
         )
         generate_all_event.then(
             fn=_save_current_session,
@@ -1090,4 +1256,16 @@ with gr.Blocks(theme=unified_theme, title="Local Deck Compiler", css=dark_panel_
 
 
 if __name__ == "__main__":
-    demo.launch(inbrowser=True, allowed_paths=[os.path.abspath("generated_presentations"), os.path.abspath("layout_templates")])
+    # Optional public link (set in .env): GRADIO_SHARE=1 creates a temporary *.gradio.live URL that
+    # tunnels to THIS machine. Always protect it with GRADIO_USER / GRADIO_PASSWORD.
+    _share = os.getenv("GRADIO_SHARE", "").strip().lower() in ("1", "true", "yes")
+    _user, _pass = os.getenv("GRADIO_USER", "").strip(), os.getenv("GRADIO_PASSWORD", "").strip()
+    if _share and not (_user and _pass):
+        raise SystemExit("GRADIO_SHARE is on but GRADIO_USER / GRADIO_PASSWORD are not set in .env. "
+                         "Refusing to publish an open link to your GPU; set both and restart.")
+    demo.launch(
+        inbrowser=not _share,
+        share=_share,
+        auth=(_user, _pass) if (_user and _pass) else None,
+        allowed_paths=[os.path.abspath("generated_presentations"), os.path.abspath("layout_templates")],
+    )
