@@ -1,6 +1,6 @@
-# Merge notes: Claude session/layout update + Ollama safeguards
+# Merge notes: Layout update + Ollama safeguards
 
-This package is based on `ai-presentation-studio-fixed (3).zip` and preserves Claude's session and slide-design improvements while restoring and extending the Ollama resilience safeguards from the previous AI Presentation Studio build.
+This package is based on `ai-presentation-studio-fixed.zip` and preserves session and slide-design improvements while restoring and extending the Ollama resilience safeguards from the previous AI Presentation Studio build.
 
 ## Preserved from Claude's version
 
